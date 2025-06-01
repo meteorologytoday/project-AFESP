@@ -25,12 +25,10 @@ for (( i=0 ; i < $(( ${#params[@]} / $nparams )) ; i++ )); do
     echo ":: origin        = $origin"
     echo ":: model_version = $model_version"
     echo ":: ens_range     = $ens_range"
-
-
-
+    
     for lead_day in 0 5 10 20 30 ; do
         
-
+        
         output_file=$output_dir/${origin}_${test_day}_lead-${lead_day}.svg
 
         if [ -f "$output_file" ] ; then
