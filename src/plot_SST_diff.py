@@ -12,9 +12,15 @@ import xarray as xr
 import S2S_tools
 import ERA5_tools
 import ens_tools
+import regrid_tools
+import oisst_data_loader
+
+oisst_root = Path("/data/SO3/t2hsu/data/SST/postprocessed")
+
 if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description='Process some integers.')
+    parser.add_argument('--verification-dataset', type=str, help='Input directories.', required=True, choices=["oisst", "ERA5"])
     parser.add_argument('--archive-root', type=str, help='Input directories.', required=True)
     parser.add_argument('--origin', type=str, help='Input directories.', required=True)
     parser.add_argument('--model-version', type=str)
@@ -23,6 +29,7 @@ if __name__ == "__main__":
     parser.add_argument('--output', type=str, default="")
     parser.add_argument('--nwp-type', type=str, help='Type of NWP. Valid options: `forecast`, `hindcast`.', required=True, choices=["forecast", "hindcast"])
     parser.add_argument('--no-display', action="store_true", help='No display GUI.',)
+    parser.add_argument('--omit-abs', action="store_true", help='No display GUI.',)
     parser.add_argument('--plot-lat-rng', type=float, nargs=2, help='Plot range of latitude', default=[-90, 90])
     parser.add_argument('--plot-lon-rng', type=float, nargs=2, help='Plot range of latitude', default=[0, 360])
     parser.add_argument('--ens-range', type=str, help='Plot range of latitude', required=True)
@@ -33,6 +40,12 @@ if __name__ == "__main__":
     
     start_time = pd.Timestamp(args.start_time)
     lead_time = pd.Timedelta(days=args.lead_day)
+    veri_time = start_time + lead_time
+
+    print("Start time: ", start_time)
+    print("Lead  time: ", lead_time)
+    print("Verification time: ", veri_time)
+
 
     ens_range = ens_tools.parseRanges(args.ens_range) 
 
@@ -49,25 +62,65 @@ if __name__ == "__main__":
 
     ds_mean = ds.mean(dim="number")
     ds_stderr = ds.std(dim="number") #/ (len(ds.coords["number"])**0.5)
+
+    if args.verification_dataset == "ERA5": 
  
-           
-    ds_ERA5 = ERA5_tools.open_dataset(
-        start_time + lead_time,
-        "6_hourly",
-        "sea_surface_temperature",
-    )["sst"].isel(time=0)
+        ds_veri = ERA5_tools.open_dataset(
+            veri_time,
+            "6_hourly",
+            "sea_surface_temperature",
+        )["sst"].isel(time=0)
 
-    print("ERA5 loaded. Need to interpolate.")
+        print("ERA5 loaded. Need to interpolate.")
 
-    ds_ERA5 = ds_ERA5.interp(
+    elif args.verification_dataset == "oisst":
+            
+        ds_veri = oisst_data_loader.load_dataset(
+            "oisst",
+            veri_time,
+            veri_time,
+            inclusive="both",
+            root=oisst_root,
+        )["sst"].isel(time=0)
+
+        ds_veri = ds_veri.rename({"lon":"longitude", "lat":"latitude"})
+
+
+        print("oisst loaded.")
+   
+    _coords = ds_veri.coords
+
+    _lat = _coords["latitude"].to_numpy()
+    _lon = _coords["longitude"].to_numpy()
+
+    dlat = _lat[1] - _lat[0]
+    dlon = _lon[1] - _lon[0]
+
+
+    image = ds_veri.to_numpy()
+    print("ORIGINAL SHAPE : ", image.shape)
+    image = regrid_tools.doGaussianFilter(
+        image,
+        half_Nx = 5,
+        half_Ny = 5,
+        dx = dlon,
+        dy = dlat,
+        sig_x = 2.0,
+        sig_y = 2.0,
+        periodic_lon=False,
+    )
+    print("SMOOTHED SHAPE : ", image.shape)
+
+    
+    ds_veri.data[:] = image
+   
+    ds_veri = ds_veri.interp(
         coords=dict(
             latitude  = ds.coords["latitude"],
             longitude = ds.coords["longitude"],
         ),
     )
 
-    print(ds)
-    print(ds_ERA5)
 
     print("Loading matplotlib...")
 
@@ -142,7 +195,10 @@ if __name__ == "__main__":
     map_projection = ccrs.PlateCarree(central_longitude=cent_lon)
     map_transform = ccrs.PlateCarree()
 
-    ncol = 3
+    if args.omit_abs:
+        ncol = 1
+    else:
+        ncol = 3
     nrow = 1
 
     h = 5
@@ -176,7 +232,7 @@ if __name__ == "__main__":
     )
 
 
-    fig.suptitle("Start time: %s, lead day: %d" % (start_time.strftime("%Y-%m-%d"), args.lead_day,))
+    fig.suptitle("Start time: %s, lead day: %d. Verification time: %s" % (start_time.strftime("%Y-%m-%d"), args.lead_day, veri_time.strftime("%Y-%m-%d")))
 
     coords = ds.coords
 
@@ -184,46 +240,53 @@ if __name__ == "__main__":
 
     ax_flatten = ax.flatten()
 
-    # ERA5
-    _ax = ax_flatten[0]
-    _shading = ds_ERA5.to_numpy() - plot_info["origin"]
-    mappable = _ax.contourf(
-        coords["longitude"], coords["latitude"],
-        _shading,
-        levels=plot_info["abs"]["shading_levels"],
-        cmap=plot_info["abs"]["cmap"], 
-        extend="both", 
-        transform=map_transform,
-    )
+    ax_idx = 0
 
-    cax = tool_fig_config.addAxesNextToAxes(fig, _ax, "right", thickness=0.3, spacing=0.3, flag_ratio_thickness=False, flag_ratio_spacing=False)
-    cb = plt.colorbar(mappable, cax=cax, orientation="vertical", pad=0.00)
-    cb.ax.tick_params(axis='both', labelsize=15 * font_size_factor)
-    unit_str = "" if plot_info["unit"] == "" else " [ %s ]" % (plot_info["unit"],)
-    cb.ax.set_ylabel(unit_str, size=25 * font_size_factor)
+    if args.omit_abs is False:
+        # ERA5
+        _ax = ax_flatten[ax_idx] ; ax_idx += 1
+        _shading = ds_veri.to_numpy() - plot_info["origin"]
+        mappable = _ax.contourf(
+            coords["longitude"], coords["latitude"],
+            _shading,
+            levels=plot_info["abs"]["shading_levels"],
+            cmap=plot_info["abs"]["cmap"], 
+            extend="both", 
+            transform=map_transform,
+        )
 
-    # ECCC
-    _ax = ax_flatten[1]
-    _shading = ds_mean.to_numpy() - plot_info["origin"]
-    mappable = _ax.contourf(
-        coords["longitude"], coords["latitude"],
-        _shading,
-        levels=plot_info["abs"]["shading_levels"],
-        cmap=plot_info["abs"]["cmap"], 
-        extend="both", 
-        transform=map_transform,
-    )
-    cax = tool_fig_config.addAxesNextToAxes(fig, _ax, "right", thickness=0.3, spacing=0.3, flag_ratio_thickness=False, flag_ratio_spacing=False)
-    cb = plt.colorbar(mappable, cax=cax, orientation="vertical", pad=0.00)
-    cb.ax.tick_params(axis='both', labelsize=15 * font_size_factor)
-    unit_str = "" if plot_info["unit"] == "" else " [ %s ]" % (plot_info["unit"],)
-    cb.ax.set_ylabel(unit_str, size=25 * font_size_factor)
+        cax = tool_fig_config.addAxesNextToAxes(fig, _ax, "right", thickness=0.3, spacing=0.3, flag_ratio_thickness=False, flag_ratio_spacing=False)
+        cb = plt.colorbar(mappable, cax=cax, orientation="vertical", pad=0.00)
+        cb.ax.tick_params(axis='both', labelsize=15 * font_size_factor)
+        unit_str = "" if plot_info["unit"] == "" else " [ %s ]" % (plot_info["unit"],)
+        cb.ax.set_ylabel(unit_str, size=25 * font_size_factor)
+        _ax.set_title("(a) %s" % (args.verification_dataset,))
+
+        # ECCC
+        _ax = ax_flatten[ax_idx] ; ax_idx += 1
+        _shading = ds_mean.to_numpy() - plot_info["origin"]
+        mappable = _ax.contourf(
+            coords["longitude"], coords["latitude"],
+            _shading,
+            levels=plot_info["abs"]["shading_levels"],
+            cmap=plot_info["abs"]["cmap"], 
+            extend="both", 
+            transform=map_transform,
+        )
+        cax = tool_fig_config.addAxesNextToAxes(fig, _ax, "right", thickness=0.3, spacing=0.3, flag_ratio_thickness=False, flag_ratio_spacing=False)
+        cb = plt.colorbar(mappable, cax=cax, orientation="vertical", pad=0.00)
+        cb.ax.tick_params(axis='both', labelsize=15 * font_size_factor)
+        unit_str = "" if plot_info["unit"] == "" else " [ %s ]" % (plot_info["unit"],)
+        cb.ax.set_ylabel(unit_str, size=25 * font_size_factor)
+        
+
+        _ax.set_title("(b) %s" % (args.origin,))
 
 
 
     # diff = ECCC - ERA5
-    _ax = ax_flatten[2]
-    _shading = ds_mean.to_numpy() - ds_ERA5.to_numpy()
+    _ax = ax_flatten[ax_idx] ; ax_idx += 1
+    _shading = ds_mean.to_numpy() - ds_veri.to_numpy()
     mappable = _ax.contourf(
         coords["longitude"], coords["latitude"],
         _shading,
@@ -243,7 +306,7 @@ if __name__ == "__main__":
     _dot = np.zeros_like(_shading)
     #_dot[:] = np.nan
 
-    _significant_idx =  np.abs(ds_mean.to_numpy() - ds_ERA5.to_numpy()) > ds_stderr.to_numpy() 
+    _significant_idx =  np.abs(ds_mean.to_numpy() - ds_veri.to_numpy()) > ds_stderr.to_numpy() 
     _dot[ _significant_idx                 ] = 0.75
     _dot[ np.logical_not(_significant_idx) ] = 0.25
     cs = _ax.contourf(coords["longitude"], coords["latitude"], _dot, colors='none', levels=[0, 0.5, 1], hatches=[None, "..."], transform=map_transform)
@@ -257,9 +320,7 @@ if __name__ == "__main__":
 
 
 
-    ax_flatten[0].set_title("(a) ERA5")
-    ax_flatten[1].set_title("(b) %s" % (args.origin,))
-    ax_flatten[2].set_title("(c) %s - ERA5" % (args.origin,))
+    _ax.set_title("(c) %s - %s" % (args.origin, args.verification_dataset))
 
     for __ax in ax_flatten:
             
